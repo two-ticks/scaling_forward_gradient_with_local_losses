@@ -35,7 +35,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="mnist", choices=["mnist", "cifar10"])
     p.add_argument("--mode", default="activity",
-                   choices=["activity", "weight", "backprop"])
+                   choices=["activity", "activity_guess", "weight", "backprop"])
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)

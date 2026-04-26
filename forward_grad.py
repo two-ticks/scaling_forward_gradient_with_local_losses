@@ -6,7 +6,7 @@ For an unbiased forward-gradient estimator the recipe is:
   g_hat = c * v
   E[g_hat] = E[(grad L . v) v] = grad L
 
-Two variants are implemented per the paper:
+Variants implemented:
 
 * Weight perturbation: v lives on the parameters; g_hat is a per-param gradient
   estimate. Variance ~ #params, so the local-losses split is what makes this
@@ -17,11 +17,20 @@ Two variants are implemented per the paper:
   (one step of backprop, not full backprop) to populate weight grads. The
   local head's own parameters are trained with exact gradients (it's a single
   linear layer).
+* Activity perturbation with a local-head-gradient guess (Fournier, Aida,
+  Oyallon, ICML 2023, "Can Forward Gradient Match Backpropagation?"). Replace
+  the random Gaussian tangent with the exact gradient of a local auxiliary
+  loss. The estimator is deterministic and biased (it returns the projection
+  of the true downstream gradient onto the guess direction) but the variance
+  reduction over isotropic Gaussian noise is dramatic. JVP scope is extended
+  to span downstream blocks so the guess is meaningful.
 
-Between blocks we always detach activations to keep losses local.
+For the random-tangent modes, between blocks we always detach activations to
+keep losses local. For the guess mode we still update one block at a time,
+but the JVP traverses downstream blocks (their params treated as constants).
 
-`n_samples > 1` averages K independent JVP samples per step. Each sample is
-unbiased; averaging cuts variance by a factor of K at K-times the cost.
+`n_samples > 1` averages K independent JVP samples per step for the random-
+tangent modes; the guess mode is deterministic and ignores it.
 """
 from __future__ import annotations
 
@@ -129,6 +138,80 @@ def train_step_activity_pert(model, x, y, optimizer, n_samples: int = 1):
     return torch.stack(losses).mean()
 
 
+def train_step_activity_pert_guess(model, x, y, optimizer, n_samples: int = 1):
+    """Activity perturbation with the local-head gradient as the JVP tangent.
+
+    Following Fournier, Aida, Oyallon (ICML 2023): replace the Gaussian tangent
+    with v_b = grad CE(head_b(z_b), y) wrt z_b (one cheap head backward), then
+    JVP a downstream loss along v_b. The activity-gradient estimate
+        g_z_b = (c_b / ||v_b||^2) * v_b
+    is the projection of the true downstream gradient onto v_b -- biased, but
+    near-zero variance. When the local head is well aligned with the
+    downstream task, the bias is small and this dramatically beats a random
+    Gaussian tangent on equal step budget.
+
+    Per block b:
+      1. v_b = grad CE(head_b(z_b), y) wrt z_b           (exact)
+      2. c_b = JVP of L_downstream(z_b) along v_b        (forward-mode AD)
+              L_downstream = mean over j>=b of CE(head_j(z_j(z_b)), y)
+      3. g_z_b = (c_b / ||v_b||^2) * v_b
+      4. z_b.backward(g_z_b)                             (one-block backprop)
+      5. local head: exact gradient
+    """
+    del n_samples  # estimator is deterministic; no MC sampling
+    optimizer.zero_grad(set_to_none=True)
+    blocks = list(model.blocks)
+    heads = list(model.heads)
+    B = len(blocks)
+    losses = []
+    z = x
+
+    for b in range(B):
+        block, head = blocks[b], heads[b]
+        z_in = z.detach()
+        z_out = block(z_in)
+
+        # 1) Guess: exact gradient of local head loss wrt z_out.
+        z_for_guess = z_out.detach().requires_grad_(True)
+        guess_loss = F.cross_entropy(head(z_for_guess), y)
+        v = torch.autograd.grad(guess_loss, z_for_guess)[0].detach()
+
+        # 2) JVP of downstream loss along v. Downstream params treated as
+        #    constants by passing detached params via functional_call.
+        head_p = _detached_params(head)
+        downstream = [
+            (blocks[j], heads[j],
+             _detached_params(blocks[j]), _detached_params(heads[j]))
+            for j in range(b + 1, B)
+        ]
+
+        def downstream_loss(z_):
+            ls = [F.cross_entropy(functional_call(head, head_p, z_), y)]
+            cur = z_
+            for blk, hd, p_blk, p_hd in downstream:
+                cur = functional_call(blk, p_blk, cur)
+                ls.append(F.cross_entropy(functional_call(hd, p_hd, cur), y))
+            return torch.stack(ls).mean()
+
+        _, c = jvp(downstream_loss, (z_out.detach(),), (v,))
+
+        v_norm_sq = (v * v).sum().clamp_min(1e-12)
+        g_z = (c.detach() / v_norm_sq) * v
+
+        # 3) One-block backprop through block b.
+        z_out.backward(g_z)
+
+        # 4) Local head: exact gradient.
+        head_loss_exact = F.cross_entropy(head(z_out.detach()), y)
+        head_loss_exact.backward()
+
+        losses.append(head_loss_exact.detach())
+        z = z_out
+
+    optimizer.step()
+    return torch.stack(losses).mean()
+
+
 def train_step_backprop(model, x, y, optimizer, n_samples: int = 1):
     """End-to-end backprop baseline over the sum of per-block local losses."""
     del n_samples  # exact gradient; no MC sampling
@@ -147,5 +230,6 @@ def train_step_backprop(model, x, y, optimizer, n_samples: int = 1):
 TRAIN_STEPS = {
     "weight": train_step_weight_pert,
     "activity": train_step_activity_pert,
+    "activity_guess": train_step_activity_pert_guess,
     "backprop": train_step_backprop,
 }
